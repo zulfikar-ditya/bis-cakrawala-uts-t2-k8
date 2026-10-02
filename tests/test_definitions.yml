@@ -1,183 +1,112 @@
-# 6 test kualitas data — severity wajib: blocking | warning
-# expected: pass | fail   (fail = memang menangkap masalah yang kamu lihat di profil)
-# sql harus mengembalikan SATU angka: jumlah baris yang melanggar.
-# Angka di `perkiraan_baris` diambil dari `pipeline.profile`, bukan tebakan.
+# 6 test kualitas data — K2 · T3 Cuaca BMKG Kota Makassar (slice k3)
+# severity : blocking (data tidak boleh masuk warehouse) | warning (boleh masuk, harus ada yang tahu)
+# expected : pass | fail  (fail = test memang menangkap masalah yang terlihat di profil)
+# sql      : mengembalikan SATU angka = jumlah baris yang melanggar.
+# perkiraan_baris diambil dari docs/profile_t3_k3.md + cek profiling tambahan (docs/pembagian_tugas.md).
+#
+# scope: source → dijalankan pada view raw_* (CSV dibaca all_varchar, maka pakai TRY_CAST).
+# Pemetaan kolom sumber → fact_prakiraan_cuaca:
+#   adm4 → kode_desa · utc_datetime → waktu_utc · analysis_date → analisis_utc
+#   t → t_celsius · ws → ws_kmh · hu → hu_persen · tp → tp_mm · weather → dim_cuaca.kode_cuaca · vs → vs_m
+#
+# Catatan "nol hujan": Makassar praktis kering di snapshot ini (tp = 0 di 2844 dari 2874 baris, maks 0.2 mm,
+# kode cuaca hanya 0/1/2/3 — tidak ada kode hujan). Sinyal siaga datang dari angin & suhu:
+# ambang siaga = t_celsius >= 33 ATAU ws_kmh >= 20 (sama dengan q01–q03 dan docs/kamus_metrik.md)
+# → 160 slot / 67 desa / 11 kecamatan (ws >= 20: 98 slot / 48 desa; t >= 33: 62 slot / 19 desa; 0 keduanya).
+# Karena itu test di bawah menjaga kolom t & ws (rentang, grain, run) — bukan curah hujan.
 
 tests:
-  # ---------------------------------------------------------------- T1 Kampus
-  - name: nim_duplikat
-    topic: t1
-    severity: warning
+  - name: grain_desa_slot_run_unik
+    topic: t3
+    severity: blocking
     scope: source
     sql: >-
-      SELECT count(*) FROM (SELECT nim FROM raw_mahasiswa GROUP BY 1 HAVING count(*) > 1)
+      SELECT count(*) FROM (SELECT adm4, utc_datetime, analysis_date FROM raw_prakiraan_cuaca
+      GROUP BY 1, 2, 3 HAVING count(*) > 1)
     expected: pass
     perkiraan_baris: 0
-    justifikasi: NIM adalah kunci bisnis mahasiswa; duplikat di sini berarti dua orang terbaca satu.
-  - name: presensi_duplikat_grain
-    topic: t1
-    severity: blocking
-    scope: source
-    sql: >-
-      SELECT count(*) FROM (SELECT nim, kode_mk, tanggal FROM raw_presensi
-      GROUP BY 1,2,3 HAVING count(*) > 1)
-    expected: fail
-    perkiraan_baris: 4344
-    justifikasi: Grain fact presensi = satu mahasiswa per pertemuan per MK; baris kembar menggandakan kehadiran.
-  - name: tanggal_presensi_format_lain
-    topic: t1
-    severity: blocking
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_presensi WHERE tanggal LIKE '__/__/____'
-    expected: fail
-    perkiraan_baris: 5812
-    justifikasi: dd/mm/yyyy tidak bisa diparse sebagai ISO; kalau dibiarkan, tanggalnya jadi NULL atau salah.
-  - name: nilai_di_luar_rentang
-    topic: t1
-    severity: blocking
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_nilai
-      WHERE TRY_CAST(nilai_angka AS INT) > 100 OR TRY_CAST(nilai_angka AS INT) < 0
-    expected: fail
-    perkiraan_baris: 2
-    justifikasi: Nilai 117 dan -5 bukan nilai; keduanya merusak rata-rata per MK.
-  - name: status_presensi_di_luar_domain
-    topic: t1
-    severity: warning
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_presensi
-      WHERE upper(trim(status)) NOT IN ('HADIR','H','IZIN','SAKIT','ALPA')
-    expected: fail
-    perkiraan_baris: 11819
-    justifikasi: 9 varian kapital bercampur; harus dinormalkan sebelum jadi measure.
-  - name: mahasiswa_angkatan_kosong
-    topic: t1
-    severity: blocking
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_mahasiswa WHERE angkatan IS NULL OR angkatan = ''
-    expected: fail
-    perkiraan_baris: 62
-    justifikasi: Slice tim dibentuk dari angkatan; baris tanpa angkatan tidak masuk tim mana pun.
+    justifikasi: >-
+      Grain fact = 1 desa × 1 slot × 1 run analisis, PK (kode_desa, waktu_utc, analisis_utc, tanggal_sk).
+      Profil: (adm4, utc_datetime) sudah unik (2874 = 2874), jadi dengan run analisis pun 0 kembar.
+      Kalau kembar, upsert ON CONFLICT menimpa baris diam-diam dan slot siaga terhitung ganda — blocking.
 
-  # ---------------------------------------------------------------- T2 POS UMKM
-  - name: transaction_id_duplikat
-    topic: t2
+  - name: desa_orphan_tanpa_master
+    topic: t3
     severity: blocking
     scope: source
     sql: >-
-      SELECT count(*) FROM (SELECT transaction_id FROM raw_transactions
-      GROUP BY 1 HAVING count(*) > 1)
-    expected: fail
-    perkiraan_baris: 219
-    justifikasi: ID transaksi yang kembar membuat omzet terhitung dua kali.
-  - name: item_fk_orphan
-    topic: t2
-    severity: blocking
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_transaction_items i
-      WHERE NOT EXISTS (SELECT 1 FROM raw_products p WHERE p.product_id = i.product_id)
-    expected: fail
-    perkiraan_baris: 1
-    justifikasi: Item tanpa produk tidak bisa di-join ke dimensi — butuh anggota Unknown, bukan dibuang diam-diam.
-  - name: timestamp_utc_tanpa_zona
-    topic: t2
-    severity: warning
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_transactions WHERE tanggal_waktu LIKE '%Z'
-    expected: fail
-    perkiraan_baris: 2389
-    justifikasi: 15% timestamp UTC tanpa tanda, 85% waktu lokal — kalau tidak dikonversi, omzet per jam salah 7 jam.
-  - name: transaksi_tanpa_item
-    topic: t2
-    severity: warning
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_transactions t
-      WHERE NOT EXISTS (SELECT 1 FROM raw_transaction_items i WHERE i.transaction_id = t.transaction_id)
-    expected: fail
-    perkiraan_baris: 158
-    justifikasi: Reconciliation transaksi ↔ item; tanpa ini, total transaksi dan total item tidak akan pernah cocok.
-  - name: qty_negatif_bukan_refund
-    topic: t2
-    severity: warning
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_transaction_items i
-      JOIN raw_transactions t USING (transaction_id)
-      WHERE TRY_CAST(i.qty AS INT) < 0 AND upper(trim(t.status)) <> 'REFUND'
-    expected: fail
-    perkiraan_baris: 621
-    justifikasi: qty negatif hanya sah untuk retur; di luar itu, tandanya salah.
-  - name: harga_satuan_tidak_positif
-    topic: t2
-    severity: blocking
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_transaction_items WHERE TRY_CAST(harga_satuan AS BIGINT) <= 0
+      SELECT count(*) FROM raw_prakiraan_cuaca p
+      WHERE NOT EXISTS (SELECT 1 FROM raw_desa d WHERE d.kode = p.adm4)
     expected: pass
     perkiraan_baris: 0
-    justifikasi: Harga nol/negatif merusak semua measure omzet di hilir.
+    justifikasi: >-
+      FK fact → dim_lokasi lewat kode_desa (adm4). Profil: 153 desa di prakiraan = 153 desa di desa.csv,
+      semuanya kabkot 73.71, dan kode_diminta selalu = adm4 (0 selisih). Baris orphan akan jatuh ke
+      lokasi_sk = -1 dan hilang dari filter slice kode_kabkot = '73.71' di q01–q03 — blocking.
 
-  # ---------------------------------------------------------------- T3 Cuaca BMKG
-  - name: duplikat_grain_desa_slot
+  - name: desa_run_terbaru_basi
+    topic: t3
+    severity: warning
+    scope: source
+    sql: >-
+      WITH run_desa AS (SELECT adm4, max(analysis_date) AS run_terbaru
+                        FROM raw_prakiraan_cuaca GROUP BY 1)
+      SELECT count(*) FROM raw_prakiraan_cuaca p JOIN run_desa r USING (adm4)
+      WHERE r.run_terbaru < (SELECT max(analysis_date) FROM raw_prakiraan_cuaca)
+    expected: fail
+    perkiraan_baris: 18
+    justifikasi: >-
+      Snapshot mencampur 2 run: analysis_date 2026-09-19T12 = 2856 baris / 152 desa, 2026-09-19T00 =
+      18 baris / 1 desa. Desa itu tidak punya run terbaru, jadi v_prakiraan_terbaru memakai prakiraan
+      12 jam lebih tua untuknya. Grain menyimpan semua run (sah), maka warning bukan blocking — tetapi
+      metrik desa siaga harus tahu 1 dari 153 desa basi. Ini juga guard test kamus metrik: kalau angka
+      turun ke 0 tanpa snapshot baru, berarti run lama dibuang diam-diam (lihat docs/kamus_metrik.md).
+
+  - name: hujan_berlabel_cerah
+    topic: t3
+    severity: warning
+    scope: source
+    sql: >-
+      SELECT count(*) FROM raw_prakiraan_cuaca
+      WHERE TRY_CAST(tp AS DOUBLE) > 0 AND TRY_CAST(weather AS INT) IN (0, 1)
+    expected: fail
+    perkiraan_baris: 30
+    justifikasi: >-
+      Profil: tp = 0 di 2844 baris, jadi hanya 30 baris tp > 0 (0.1–0.2 mm) — dan semuanya berkode
+      0/1 "Cerah". Jumlah hujan bertentangan dengan deskripsi. Warning, bukan blocking: nilainya kecil dan
+      tidak memengaruhi siaga (siaga dari angin & suhu, bukan hujan), tetapi kueri "slot hujan" berbasis
+      dim_cuaca vs berbasis tp_mm akan memberi jawaban berbeda.
+
+  - name: visibilitas_vs_kosong
+    topic: t3
+    severity: warning
+    scope: source
+    sql: >-
+      SELECT count(*) FROM raw_prakiraan_cuaca WHERE vs IS NULL OR trim(vs) = ''
+    expected: fail
+    perkiraan_baris: 2874
+    justifikasi: >-
+      Profil: vs_kosong = 2874 dari 2874 (100%). Kolom tetap dimuat sebagai vs_m (NULL) agar skema stabil
+      bila BMKG mengisinya nanti, tetapi tidak boleh dipakai sebagai measure atau sinyal siaga.
+      Warning: datanya boleh masuk; jika angka turun di bawah 2874, vs mulai terisi dan perlu ditinjau.
+
+  - name: suhu_angin_di_luar_rentang_fisik
     topic: t3
     severity: blocking
     scope: source
     sql: >-
-      SELECT count(*) FROM (SELECT adm4, local_datetime FROM raw_prakiraan_cuaca
-      GROUP BY 1,2 HAVING count(*) > 1)
+      SELECT count(*) FROM raw_prakiraan_cuaca
+      WHERE TRY_CAST(t AS DOUBLE) NOT BETWEEN 15 AND 42
+         OR TRY_CAST(ws AS DOUBLE) NOT BETWEEN 0 AND 120
+         OR TRY_CAST(hu AS DOUBLE) NOT BETWEEN 0 AND 100
+         OR TRY_CAST(tp AS DOUBLE) < 0
     expected: pass
     perkiraan_baris: 0
-    justifikasi: Grain = satu desa per slot; kembar berarti snapshot tertarik dua kali.
-  - name: curah_hujan_negatif
-    topic: t3
-    severity: blocking
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_prakiraan_cuaca WHERE TRY_CAST(tp AS DOUBLE) < 0
-    expected: pass
-    perkiraan_baris: 0
-    justifikasi: Curah hujan tidak bisa negatif; kalau ada, satuannya bukan mm.
-  - name: kolom_vs_kosong_seluruhnya
-    topic: t3
-    severity: warning
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_prakiraan_cuaca WHERE vs IS NULL OR vs = ''
-    expected: fail
-    perkiraan_baris: 1156
-    justifikasi: Kolom 100% kosong — putuskan dibuang atau diisi, jangan dibiarkan masuk dimensi.
-  - name: deskripsi_cuaca_dipakai_lebih_dari_satu_kode
-    topic: t3
-    severity: warning
-    scope: source
-    sql: >-
-      SELECT count(*) FROM (SELECT weather_desc FROM raw_prakiraan_cuaca
-      GROUP BY 1 HAVING count(DISTINCT weather) > 1)
-    expected: fail
-    perkiraan_baris: 1
-    justifikasi: Kode 0 dan 1 dua-duanya 'Cerah' — kamus tidak 1:1, jadi deskripsi tidak boleh jadi kunci.
-  - name: curah_hujan_nol_tidak_wajar
-    topic: t3
-    severity: warning
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_prakiraan_cuaca WHERE TRY_CAST(tp AS DOUBLE) = 0
-    expected: fail
-    perkiraan_baris: 812
-    justifikasi: 70% slot kering — cukup untuk membatalkan 'curah hujan' sebagai satu-satunya measure.
-  - name: time_index_sebagai_jam
-    topic: t3
-    severity: warning
-    scope: source
-    sql: >-
-      SELECT count(*) FROM raw_prakiraan_cuaca WHERE TRY_CAST(split_part(time_index, '-', 1) AS INT) > 23
-    expected: fail
-    perkiraan_baris: 625
-    justifikasi: time_index adalah offset jam (11-37), bukan jam dinding — kalau dipakai sebagai jam, analisis waktu salah.
+    justifikasi: >-
+      Sinyal siaga hanya dari t_celsius (>= 33) dan ws_kmh (>= 20), jadi dua kolom ini harus masuk akal.
+      Profil: t 24–36 °C, ws 0.8–27.4 km/jam, hu 41–83 %, tp 0–0.2 mm — semua di dalam batas fisik
+      kota pesisir tropis, maka 0. Batas sengaja lebih lebar dari rentang profil (bukan 24–36) supaya test
+      tidak gagal hanya karena hari panas wajar. Yang ditangkap: suhu dalam °F (≈ 75–97), kelembapan/hujan
+      mustahil, atau nilai rusak — blocking, karena satu nilai rusak langsung mengubah jumlah slot siaga.
+      Yang TIDAK ditangkap: ws dalam m/s (≈ 0.2–7.6) masih di dalam 0–120; itu dijaga lewat kamus metrik
+      (satuan km/jam) dan cek ws maks di q03.
